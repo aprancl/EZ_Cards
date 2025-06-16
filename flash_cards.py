@@ -1,4 +1,3 @@
-import pdb
 import urwid
 import sqlite3
 import random
@@ -9,66 +8,71 @@ from googletrans import Translator
 WORDS_FILE = "portuguese.txt"
 DB_FILE = "vocab.db"
 
-# Setup
-conn = sqlite3.connect(DB_FILE)
-cursor = conn.cursor()
-translator = Translator()
+def main():
+    global conn, cursor, all_words, current_word, revealed, manual_mode, main_widget, translator
 
-cursor.execute('''
-CREATE TABLE IF NOT EXISTS words (
-    word TEXT PRIMARY KEY,
-    translation TEXT,
-    seen_count INTEGER DEFAULT 0,
-    correct_count INTEGER DEFAULT 0,
-    last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-)
-''')
-conn.commit()
+    # Setup
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    translator = Translator()
 
-with open(WORDS_FILE, encoding='utf-8') as f:
-    all_words = [line.strip() for line in f if line.strip()]
-random.shuffle(all_words)
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS words (
+        word_in_pt TEXT PRIMARY KEY,
+        word_in_eng TEXT,
+        status TEXT
+    )
+    ''')
+    conn.commit()
 
-# State
-current_word = None
-revealed = False
-awaiting_answer = False
-manual_mode = False
+    with open(WORDS_FILE, encoding='utf-8') as f:
+        all_words = [line.strip() for line in f if line.strip()]
+    random.shuffle(all_words)
+
+    # Initialize state
+    current_word = get_next_word()
+    revealed = False
+    manual_mode = False
+
+    # Main UI loop
+    main_widget = urwid.WidgetPlaceholder(show_flashcard(current_word))
+    loop = urwid.MainLoop(main_widget, unhandled_input=handle_input)
+    loop.run()
 
 def get_next_word():
     for word in all_words:
-        cursor.execute("SELECT translation FROM words WHERE word = ?", (word,))
+        cursor.execute("SELECT word_in_eng FROM words WHERE word_in_pt = ?", (word,))
         result = cursor.fetchone()
         if not result or not result[0]:
             return word
     return random.choice(all_words)
 
 def total_progress():
-    cursor.execute("SELECT COUNT(*) FROM words WHERE translation IS NOT NULL")
-    learned = cursor.fetchone()[0]
-    return f"Progress: {learned}/{len(all_words)} words learned"
+    cursor.execute("SELECT status, COUNT(*) FROM words GROUP BY status")
+    rows = cursor.fetchall()
+    counts = {'new': 0, 'recognizable': 0, 'comfortable': 0, 'learned': 0}
+    for status, count in rows:
+        counts[status] = count
+    total = sum(counts.values())
+    return (
+        f"New: {counts['new']}  |  "
+        f"Recognizable: {counts['recognizable']}  |  "
+        f"Comfortable: {counts['comfortable']}  |  "
+        f"Learned: {counts['learned']}  ||  Total: {total}"
+    )
 
-def save_translation(word, translation):
-    now = datetime.now().isoformat()
+def save_translation(word, translation, status="new"):
     cursor.execute("""
-        INSERT INTO words (word, translation, seen_count, correct_count, last_seen)
-        VALUES (?, ?, 1, 0, ?)
-        ON CONFLICT(word) DO UPDATE SET
-            translation=excluded.translation,
-            seen_count=words.seen_count+1,
-            last_seen=excluded.last_seen
-    """, (word, translation, now))
+        INSERT INTO words (word_in_pt, word_in_eng, status)
+        VALUES (?, ?, ?)
+        ON CONFLICT(word_in_pt) DO UPDATE SET
+            word_in_eng=excluded.word_in_eng,
+            status=excluded.status
+    """, (word, translation, status))
     conn.commit()
 
-def update_stats(word, correct):
-    now = datetime.now().isoformat()
-    cursor.execute("""
-        UPDATE words SET
-            seen_count = seen_count + 1,
-            correct_count = correct_count + ?,
-            last_seen = ?
-        WHERE word = ?
-    """, (1 if correct else 0, now, word))
+def update_status(word, status):
+    cursor.execute("UPDATE words SET status = ? WHERE word_in_pt = ?", (status, word))
     conn.commit()
 
 def attempt_translation(word):
@@ -81,9 +85,9 @@ def attempt_translation(word):
 def make_flashcard_widget(body):
     controls = urwid.Filler(urwid.Text((
         "\nControls:\n"
-        "  enter  → Flip Card\n"
-        "  enter again  → Next Card\n"
-        "  ESC    → Exit"
+        "  enter → Flip Card\n"
+        "  number (1-4) → Set Status\n"
+        "  ESC   → Exit"
     ), align='left'), valign='top')
 
     layout = urwid.Pile([
@@ -98,38 +102,34 @@ def make_flashcard_widget(body):
         footer=footer
     )
 
-def show_flashcard(word, reveal=False, ask=False):
-    cursor.execute("SELECT translation FROM words WHERE word = ?", (word,))
+def show_flashcard(word, reveal=False):
+    cursor.execute("SELECT word_in_eng FROM words WHERE word_in_pt = ?", (word,))
     result = cursor.fetchone()
 
     if not result:
-        # Word not in DB — attempt translation silently
         translation = attempt_translation(word)
         if translation:
             save_translation(word, translation)
         else:
-            # No internet: ask for manual entry
             global manual_mode
             manual_mode = True
             return make_flashcard_widget(
                 urwid.Edit(f"Portuguese: {word}\n\nNo internet.\nEnter translation manually:\n> ")
             )
 
-    # Now load again (whether we just saved it or it existed)
-    cursor.execute("SELECT translation FROM words WHERE word = ?", (word,))
+    cursor.execute("SELECT word_in_eng FROM words WHERE word_in_pt = ?", (word,))
     result = cursor.fetchone()
 
     if not reveal:
         return make_flashcard_widget(
-            urwid.Text(f"Portuguese: {word}\n\nPress SPACE to reveal the translation")
-        )
-    elif not ask:
-        return make_flashcard_widget(
-            urwid.Text(f"Portuguese: {word}\n\nTranslation: {result[0]}\n\nPress any key to continue...")
+            urwid.Text(f"Portuguese: {word}\n\nPress ENTER to reveal the translation")
         )
     else:
         return make_flashcard_widget(
-            urwid.Text("Did you know this word?\nPress 'y' or 'n'")
+            urwid.Text(
+                f"Portuguese: {word}\n\nTranslation: {result[0]}\n\n"
+                f"Rate your knowledge:\n1. New  2. Recognizable  3. Comfortable  4. Learned"
+            )
         )
 
 def handle_input(key):
@@ -140,7 +140,6 @@ def handle_input(key):
 
     widget = main_widget.original_widget.body.original_widget.original_widget
 
-    # Handle manual mode for offline translation entry
     if isinstance(widget, urwid.Edit) and manual_mode:
         if key == 'enter':
             lines = widget.edit_text.strip().split('\n')
@@ -153,18 +152,19 @@ def handle_input(key):
                 main_widget.original_widget = show_flashcard(current_word)
         return
 
-    # Flashcard flow using ENTER
     if key == 'enter':
         if not revealed:
             revealed = True
             main_widget.original_widget = show_flashcard(current_word, reveal=True)
-        else:
-            update_stats(current_word, correct=True)  # optionally always record as correct
-            revealed = False
-            current_word = get_next_word()
-            main_widget.original_widget = show_flashcard(current_word)
-# Start app
-current_word = get_next_word()
-main_widget = urwid.WidgetPlaceholder(show_flashcard(current_word))
-loop = urwid.MainLoop(main_widget, unhandled_input=handle_input)
-loop.run()
+        return
+
+    if key in ('1', '2', '3', '4') and revealed:
+        status_map = {'1': 'new', '2': 'recognizable', '3': 'comfortable', '4': 'learned'}
+        update_status(current_word, status_map[key])
+        revealed = False
+        current_word = get_next_word()
+        main_widget.original_widget = show_flashcard(current_word)
+
+
+if __name__ == "__main__":
+    main()
